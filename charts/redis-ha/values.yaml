@@ -497,7 +497,7 @@ exporter:
 
 podDisruptionBudget: {}
   # maxUnavailable: 1
-  # minAvailable: 1
+  minAvailable: 1
 
 ## Configures redis with AUTH (requirepass & masterauth conf params)
 auth: false
