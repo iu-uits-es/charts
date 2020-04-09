@@ -11,7 +11,7 @@ ingress:
 ## ref: http://kubernetes.io/docs/user-guide/compute-resources/
 ##
 image:
-  repository: redis
+  repository: harbor-snd.uits.iu.edu/esimw/redis
   tag: 5.0.7-alpine
   pullPolicy: IfNotPresent
 
@@ -39,7 +39,7 @@ serviceAccount:
   create: true
   ## The name of the ServiceAccount to use.
   ## If not set and create is true, a name is generated using the redis-ha.fullname template
-  # name:
+  name: redissvc
 
 ## Enables a HA Proxy for better LoadBalancing / Sentinel Master support. Automatically proxies to Redis master.
 ## Recommend for externally exposed Redis clusters.
@@ -50,9 +50,9 @@ haproxy:
   readOnly:
     enabled: false
     port: 6380
-  replicas: 3
+  replicas: 2
   image:
-    repository: haproxy
+    repository: harbor-snd.uits.iu.edu/esimw/haproxy
     tag: 2.0.4
     pullPolicy: IfNotPresent
 
@@ -104,10 +104,11 @@ haproxy:
   init:
     resources: {}
   timeout:
-    connect: 4s
-    server: 30s
-    client: 30s
+    connect: 3s
+    server: 6s
+    client: 6s
     check: 2s
+    tunnel: 7d
   securityContext:
     runAsUser: 1000
     fsGroup: 1000
@@ -129,7 +130,137 @@ haproxy:
   ## Place any additional configuration section to add to the default config-haproxy.cfg
   # extraConfig: |-
       # Define configuration here
+  customConfig: |-
+    global
+      ## Limit TLS version to 1.2 at minimum
+      ssl-default-bind-options ssl-min-ver TLSv1.2
 
+    defaults REDIS
+      ## Output logs to stdout which would allow us to see logs from Kubernetes
+      ## Set log level to debug
+      log stdout format raw local0 debug
+      mode tcp
+      timeout connect {{ .Values.haproxy.timeout.connect }}
+      timeout server {{ .Values.haproxy.timeout.server }}
+      timeout client {{ .Values.haproxy.timeout.client }}
+      timeout check {{ .Values.haproxy.timeout.check }}
+      ## Added timeout tunnel to keep session alive
+      ## This timeout is used as soon as no analyzer remains attached to either connection
+      timeout tunnel {{ .Values.haproxy.timeout.tunnel }}
+
+    ## Important:
+    ## The following sets up an endpoint for Kubernetes health checks
+    listen health_check_http_url
+      bind :8888
+      mode http
+      monitor-uri /healthz
+      option      dontlognull
+
+    {{- $root := . }}
+    {{- $fullName := include "redis-ha.fullname" . }}
+    {{- $replicas := int (toString .Values.replicas) }}
+    {{- $masterGroupName := include "redis-ha.masterGroupName" . }}
+    {{- range $i := until $replicas }}
+    # Check Sentinel and whether they are nominated master
+    backend check_if_redis_is_master_{{ $i }}
+      mode tcp
+      option tcp-check
+      tcp-check connect
+      {{- if $root.auth }}
+      tcp-check send AUTH\ {{ $root.redisPassword }}\r\n
+      tcp-check expect string +OK
+      {{- end }}
+      tcp-check send PING\r\n
+      tcp-check expect string +PONG
+      tcp-check send SENTINEL\ get-master-addr-by-name\ {{ $masterGroupName }}\r\n
+      tcp-check expect string REPLACE_ANNOUNCE{{ $i }}
+      tcp-check send QUIT\r\n
+      tcp-check expect string +OK
+      {{- range $i := until $replicas }}
+      ## init-addr: Indicate in what order the server's address should be resolved upon startup if it uses an FQDN.
+      ## 'last,libc,none': This indicates that it will never fail on address resolution
+      server R{{ $i }} {{ $fullName }}-announce-{{ $i }}:26379 init-addr last,libc,none check inter 1s
+      {{- end }}
+    {{- end }}
+
+    # decide redis backend to use
+    #master
+    frontend ft_redis_master
+      bind *:{{ $root.Values.redis.port }}
+      use_backend bk_redis_master
+      ## Maintain a proxy operational for some time after a soft stop
+      grace 5s
+    {{- if .Values.haproxy.readOnly.enabled }}
+    #slave
+    frontend ft_redis_slave
+      bind *:{{ .Values.haproxy.readOnly.port }}
+      use_backend bk_redis_slave
+      ## Maintain a proxy operational for some time after a soft stop
+      grace 5s
+    {{- end }}
+    # Check all redis servers to see if they think they are master
+    backend bk_redis_master
+      {{- if .Values.haproxy.stickyBalancing }}
+      balance source
+      hash-type consistent
+      {{- else }}
+      ## Use "sticky" balancing by default using "first" algorithm
+      balance first
+      {{- end }}
+      mode tcp
+      option tcp-check
+      tcp-check connect
+      {{- if .Values.auth }}
+      tcp-check send AUTH\ REPLACE_AUTH_SECRET\r\n
+      tcp-check expect string +OK
+      {{- end }}
+      tcp-check send PING\r\n
+      tcp-check expect string +PONG
+      tcp-check send info\ replication\r\n
+      tcp-check expect string role:master
+      tcp-check send QUIT\r\n
+      tcp-check expect string +OK
+      {{- range $i := until $replicas }}
+      use-server R{{ $i }} if { srv_is_up(R{{ $i }}) } { nbsrv(check_if_redis_is_master_{{ $i }}) ge 2 }
+      ## init-addr: Indicate in what order the server's address should be resolved upon startup if it uses an FQDN.
+      ## 'last,libc,none': This indicates that it will never fail on address resolution
+      server R{{ $i }} {{ $fullName }}-announce-{{ $i }}:{{ $root.Values.redis.port }} init-addr last,libc,none check inter 1s fall 1 rise 1
+      {{- end }}
+    {{- if .Values.haproxy.readOnly.enabled }}
+    backend bk_redis_slave
+      {{- if .Values.haproxy.stickyBalancing }}
+      balance source
+      hash-type consistent
+      {{- else }}
+      ## Use "sticky" balancing by default using "first" algorithm
+      balance first
+      {{- end }}
+      mode tcp
+      option tcp-check
+      tcp-check connect
+      {{- if .Values.auth }}
+      tcp-check send AUTH\ REPLACE_AUTH_SECRET\r\n
+      tcp-check expect string +OK
+      {{- end }}
+      tcp-check send PING\r\n
+      tcp-check expect string +PONG
+      tcp-check send info\ replication\r\n
+      tcp-check expect  string role:slave
+      tcp-check send QUIT\r\n
+      tcp-check expect string +OK
+      {{- range $i := until $replicas }}
+      ## init-addr: Indicate in what order the server's address should be resolved upon startup if it uses an FQDN.
+      ## 'last,libc,none': This indicates that it will never fail on address resolution
+      server R{{ $i }} {{ $fullName }}-announce-{{ $i }}:{{ $root.Values.redis.port }} init-addr last,libc,none check inter 1s fall 1 rise 1
+      {{- end }}
+    {{- end }}
+    {{- if .Values.haproxy.metrics.enabled }}
+    frontend metrics
+      mode http
+      bind *:{{ .Values.haproxy.metrics.port }}
+      option http-use-htx
+      http-request use-service prometheus-exporter if { path {{ .Values.haproxy.metrics.scrapePath }} }
+    {{- end }}
 
 ## Role Based Access
 ## Ref: https://kubernetes.io/docs/admin/authorization/rbac/
@@ -155,34 +286,64 @@ sysctlImage:
 ## Redis specific configuration options
 redis:
   port: 6379
-  masterGroupName: "mymaster"       # must match ^[\\w-\\.]+$) and can be templated
-  config:
-    ## Additional redis conf options can be added below
-    ## For all available options see http://download.redis.io/redis-stable/redis.conf
-    min-replicas-to-write: 1
-    min-replicas-max-lag: 5   # Value in seconds
-    maxmemory: "0"       # Max memory to use for each redis instance. Default is unlimited.
-    maxmemory-policy: "volatile-lru"  # Max memory policy to use for each redis instance. Default is volatile-lru.
-    # Determines if scheduled RDB backups are created. Default is false.
-    # Please note that local (on-disk) RDBs will still be created when re-syncing with a new slave. The only way to prevent this is to enable diskless replication.
-    save: "900 1"
-    # When enabled, directly sends the RDB over the wire to slaves, without using the disk as intermediate storage. Default is false.
-    repl-diskless-sync: "yes"
-    rdbcompression: "yes"
-    rdbchecksum: "yes"
-
+  masterGroupName: "redis"       # must match ^[\\w-\\.]+$) and can be templated
+  evictionPolicy: "noeviction"
 
   ## Custom redis.conf files used to override default settings. If this file is
   ## specified then the redis.config above will be ignored.
-  # customConfig: |-
-      # Define configuration here
+  customConfig: |-
+    ### NETWORK ###
+    timeout 0
+    tcp-keepalive 300
+    tcp-backlog 128
 
-  resources: {}
-  #  requests:
-  #    memory: 200Mi
-  #    cpu: 100m
-  #  limits:
-  #    memory: 700Mi
+    ### GENERAL ###
+    loglevel notice
+    databases 1
+
+    ### SECURITY ###
+    requirepass replace-default-auth
+
+    ### LIMITS ###
+    maxmemory {{ mul (div .Values.redis.resources.limits.memory 100) 80 }}
+    maxmemory-policy {{ .Values.redis.evictionPolicy }}
+
+    ### REPLICATION ###
+    masterauth replace-default-auth
+    replica-serve-stale-data no
+    replica-read-only yes
+    repl-diskless-sync no
+    repl-diskless-sync-delay 0
+    repl-disable-tcp-nodelay no
+    min-replicas-max-lag 5
+    min-replicas-to-write 1
+
+    ### SNAPSHOTTING  ###
+    dir "/data"
+    save 3600 1
+    stop-writes-on-bgsave-error yes
+    rdbcompression yes
+    rdbchecksum yes
+    dbfilename dump.rdb
+
+    ### APPEND ONLY MODE ###
+    appendonly yes
+    appendfilename "appendonly.aof"
+    appendfsync always
+    no-appendfsync-on-rewrite no
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+    aof-load-truncated yes
+
+    ### LATENCY MONITOR ###
+    latency-monitor-threshold 0
+
+  resources:
+    requests:
+      memory: 200000000
+    #  cpu: 100m
+    limits:
+      memory: 700000000
 
 ## Sentinel specific configuration options
 sentinel:
@@ -201,8 +362,14 @@ sentinel:
 
   ## Custom sentinel.conf files used to override default settings. If this file is
   ## specified then the sentinel.config above will be ignored.
-  # customConfig: |-
-      # Define configuration here
+  customConfig: |-
+    dir "/data"
+    loglevel notice
+    maxclients 10000
+    sentinel auth-pass {{ .Values.redis.masterGroupName }} replace-default-auth
+    sentinel down-after-milliseconds {{ .Values.redis.masterGroupName }} 30000
+    sentinel failover-timeout {{ .Values.redis.masterGroupName }} 180000
+    sentinel parallel-syncs {{ .Values.redis.masterGroupName }} 1
 
   resources: {}
   #  requests:
@@ -351,10 +518,10 @@ persistentVolume:
   ##   set, choosing the default provisioner.  (gp2 on AWS, standard on
   ##   GKE, AWS & OpenStack)
   ##
-  # storageClass: "-"
+  storageClass: "vsphere-storage-1"
   accessModes:
     - ReadWriteOnce
-  size: 10Gi
+  size: 1Gi
   annotations: {}
   # reclaimPolicy per https://kubernetes.io/docs/concepts/storage/persistent-volumes/#reclaiming
   reclaimPolicy: ""
