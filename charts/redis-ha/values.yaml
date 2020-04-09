@@ -495,7 +495,7 @@ exporter:
     # Set timeout for scrape
     # timeout: 10s
 
-podDisruptionBudget: {}
+podDisruptionBudget:
   # maxUnavailable: 1
   minAvailable: 1
 
